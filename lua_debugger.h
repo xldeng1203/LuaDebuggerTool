@@ -96,7 +96,7 @@ class CLuaDebugger
 			return &m_arrBp[iBpnum];
 		}
 
-		int SeachBreaPoint( lua_Debug* pAr) const;
+		int SeachBreaPoint( lua_Debug* pAr ) const;
 
 		void EnableLineHook( bool isEnable);
 		void EnableFuncHook( bool isEnable);
@@ -107,9 +107,9 @@ class CLuaDebugger
 			m_bIsEnable = isEnable;
 		}
 
-		static void S_LineHook( lua_state* L, lua_Debug* pAr);
-		static void S_FuncHook( lua_state* L, lua_Debug* pAr);
-		static void S_AllHook( lua_state* L, lua_Debug* pAr);
+		static void line_hook( lua_state* L, lua_Debug* pAr );
+		static void func_hook( lua_state* L, lua_Debug* pAr );
+		static void all_Hook( lua_state* L, lua_Debug* pAr);
 
 		void OnEvent(int iBpnum, lua_Debug* pAr);
 	public:
@@ -117,9 +117,9 @@ class CLuaDebugger
 	protected:
 		CBreakPoint m_arrBp[LUA_MAX_BRKS];
 		bool 		m_bIsEnable;
-		int  		m_iCallDEpth;
+		int  		m_iCallDepth;
 		bool		m_bIsStep;
-		char 		m_sSerachPath[4096];
+		char 		m_sSearchPath[4096];
 
 		lua_State*  m_pLuaState;
 		CSourceMgr	m_pSourceMgr;
@@ -146,7 +146,7 @@ class CLuaDebugger
 
 	private:
 		void HandleCmdBreakPoint(const char* pOp, uint32 iOplen, lua_Debug* pAr);
-		void HandleCmdPoint(const char* pOp, uint32 iOplen, lua_Debug* pAr);
+		void HandleCmdPrint(const char* pOp, uint32 iOplen, lua_Debug* pAr);
 		void HandleCmdClear(const char* pOp, uint32 iOplen, lua_Debug* pAr);
 		void HandleCmdHelp(const char* pOp, uint32 iOplen, lua_Debug* pAr);
 	
@@ -156,6 +156,60 @@ class CLuaDebugger
 		bool HandleCmdStep(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr);
 		bool HandleCmdBackTrace(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr);
 };
+
+/********************************* file *********************************************/
+class CFileSource
+{
+public:
+	CFileSource()
+	{
+		m_iLineCount = -1;
+		m_sFileName = "";
+	}
+	virtual ~CFileSource() {}
+
+	bool LoadFile( const char* pFileName);
+	inline void Reset()
+	{
+		m_sFileName = "";
+		m_iLineCount = -1;
+		m_iAccesCount = 0;
+		m_lines.m_iNum = 0;
+	}
+
+	bool IsLoaded() const { return m_iLineCount != -1; }
+	const char* GetLine(int l)
+	{
+		if(l > 0 && l < m_iLineCount)
+		{
+			++m_iAccesCount;
+			return (const char*)m_lines[l].c_str();
+		}
+		return NULL;
+	}
+
+public:
+	std::string m_sFileName;
+	int m_iAccesCount;
+private:
+	int m_iLineCount;
+	CAutoPtr<std::string, 4> m_lines;
+
+}
+
+class CSourceMgr
+{
+	public:
+		CSourceMgr();
+		virtual ~CSourceMgr() {}
+
+		const char* LoadLine(const char* pFileName, int iLine);
+		void ReloadFile();
+	private:
+		enum { max_num = 4 };
+		CFileSource m_files[max_num];
+}
+
 
 
 template <typename T, int size = 4>

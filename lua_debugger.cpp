@@ -15,6 +15,8 @@
 #include "lua_debugger.h"
 #include "service_lua.h"
 
+/****************************************static function**************************************************/
+
 static void PrintLua(lua_State* L, int index, int depth = 1);
 
 static void Print(const char* pFormat, ...)
@@ -287,8 +289,574 @@ static bool PathMatch(const char* pName, const char* pFilePath, const char* pSea
 	int name_len = strlen( pName );
 	if (name_len > 2)
 	{
-		bool ret = ( strcmp( pName， pFilePath ) == 0 );
+		bool ret = ( strcmp( pName, pFilePath ) == 0 );
 		return ret;
 	}
 	return false;
+}
+
+/****************************************File Source***************************************************/
+bool CFileSource::LoadFile(const char* pFileName)
+{
+	FILE* fp = fopen( pFileName, "r" );
+	if (!fp)
+	{
+		return false;
+	}
+	
+	char buf[512];
+	std::string line("");
+	bool readComplete = false;
+	m_iLineCount = 0;
+	while ( fgets(buf, sizeof(buf), fp) != NULL )
+	{
+		for (int i = 0; buf[i] != 0 && i < 512; i++)
+		{
+			if ( buf[i] == '\r' || buf[i] == '\n')
+			{
+				buf[i] = 0;
+				line = line + buf;
+				readComplete = true;
+				break;
+			}
+		}
+		readComplete = false;
+	}
+	
+	if (readComplete)
+	{
+		if (m_iLineCount >= m_lines.m_iSize)
+		{
+			m_lines.resize();
+		}
+
+		m_lines[m_iLineCount] = line;
+		m_lines.m_iNum = ++m_iLineCount;
+		line = "";
+	}
+	else
+	{
+		line = line + buf;
+	}
+	
+	m_sFileName = pFileName;
+	fclose(fp);
+	return true;
+}
+
+
+const char* CSourceMgr::LoadLine(const char* pFileName, int iLine)
+{
+	int ie = -1;
+	int min = 9999999;
+	int im = -1;
+
+	for (int i = 0; i < max_num; i++)
+	{
+		if (m_files[i].IsLoaded())
+		{
+			if (m_files[i].m_sFileName == pFileName)
+			{
+				return m_files[i].GetLine(iLine);
+			}
+			else
+			{
+				if ( m_files[i].m_iAccesCount < min )
+				{
+					im = i;
+					min = m_files[i].m_iAccesCount;
+				}
+			}
+		}
+		else
+		{
+			if ( ie < 0 )
+			{
+				ie = i;
+			}
+		}			
+	}
+
+	if ( ie >= 0 )
+	{
+		
+		if ( !m_filesp[ie].LoadFile(pFileName) )
+		{
+			return NULL;
+		}
+		return m_files[ie].GetLine(iLine);	
+	}
+	
+	m_files[im].Reset();
+
+	if ( !m_files[im].LoadFile(pFileName) )
+	{
+		return NULL;
+	}
+	
+	return m_files[im].GetLine(line);
+}
+
+void CSourceMgr::ReloadFile()
+{
+	for (int i = 0; i < max_num; i++)
+	{
+		if (m_files[i].m_sFileName != "")
+		{
+			m_files[i].LoadFile(m_files[i].m_sFileName.c_str());
+		}
+	}
+}
+
+/****************************************lua debugger**************************************************/
+
+CLuaDebugger::Entry CLuaDebugger::m_entries[] = 
+{
+	{ "b", 		&CLuaDebugger::HandleCmdBreakPoint },
+	{ "p", 		&CLuaDebugger::HandleCmdPoint },
+	{ "clear", 	&CLuaDebugger::HandleCmdClear },
+	{ "help", 	&CLuaDebugger::HandleCmdHelp },
+	{ NULL，	NULL },
+};
+
+CLuaDebugger::EntryLdb CLuaDebugger::m_entries_ldb[] = 
+{
+	{ "c", 		&CLuaDebugger::HandleCmdContinue },
+	{ "n", 		&CLuaDebugger::HandleCmdNext },
+	{ "s", 		&CLuaDebugger::HandleCmdStep },
+	{ "bt", 	&CLuaDebugger::HandleCmdBackTrace },
+	{ NULL，	NULL },
+};
+
+CLuaDebugger::CLuaDebugger(lua_State* L)
+{
+	m_pLuaState = L;
+	m_bIsStep = false;
+	m_iCallDepth = -1;
+	m_pSourceMgr = new CSourceMgr;
+	EnableDebug(true);
+}
+
+void CLuaDebugger::SetSearchPath(const char* pPath)
+{
+	if ( !pPath || *pPath == 0 )
+	{
+		return;
+	}
+	
+	int len = strlen( pPath );
+	char slash = '/';
+	if ( pPath[len-1] == slash)
+	{
+		strncpy( m_sSearchPath, path, 4096);
+	}
+	else
+	{
+		strncpy( m_sSearchPath, path, 4096);
+		if ( len < 4095)
+		{
+			m_sSearchPath[len] = slash;
+			m_sSearchPath[len+1] = 0;
+		}
+	}
+}
+
+int CLuaDebugger::SeachBreaPoint( lua_Debug* pAr ) const
+{
+	int i = 0;
+	if ( pAr->source[0] == '@' )
+	{
+		for ( i = 0; i < LUA_MAX_BRKS; i++)
+		{
+			if ( m_arrBp[i].m_type != CBreakPoint::None
+				&& m_arrBp[i].m_iLineNum >= 0
+				&& pAr->currentline == (int)m_arrBp[i].m_iLineNum + 1
+				&& PathMatch(pAr->source+1, m_arrBp[i].m_sName, m_sSearchPath) )
+			{
+				return i;
+			}			
+		}		
+	}
+	return -1;
+}
+
+void CLuaDebugger::EnableLineHook( bool isEnable)
+{
+	lua_State* L = m_pLuaState;
+	int mask = lua_gethookmask(L);
+	if ( isEnable )
+	{
+		int ret = lua_sethook(L, all_hook, mask | LUA_MASKLINE, 0);
+		assert( ret != 0);
+	}
+	else
+	{
+		int ret = lua_sethook(L, all_hook, mask & ~LUA_MASKLINE, 0);
+		assert( ret != 0);
+	}
+}
+
+void CLuaDebugger::EnableFuncHook( bool isEnable )
+{
+}
+
+void CLuaDebugger::OnEvent( int iBpnum, lua_Debug* pAr)
+{
+	lua_State* L = m_pLuaState;
+	int depth = GetCallDepth(L);
+	if ( iBpnum < 0  && m_iCallDepth != -1 && dpeth > m_iCallDepth )
+	{
+		return;
+	}
+
+	m_iCallDepth = depth;
+	if ( iBpnum >= 0 )
+	{
+		Print("BreakPoint #%d hit!\n", iBpnum);
+	}
+
+	SetPropmpt();
+
+	if ( pAr && pAr->source[0] == '@' && pAr->currentline != -1)
+	{
+		char fn[4096];
+		strncpy(fn, m_sSearchPath, 4096);
+		fn[4095] = 0;
+
+		int addlen = strlen(fn);
+		int offset = pAr->source[1] == '.' ? 3 : 1;
+
+		strncpy(fn+addlen, pAr->source + offset, 4096-addlen);
+		fn[4095] = 0;
+
+		const char* pLine = m_pSourceMgr->LoadLine( fn, pAr->currentline-1 );
+		if (!pLine)
+		{
+			Print("[cannot load source %s:%d\n]", pAr->source+1, pAr->currentline);
+		}
+		else
+		{
+			Print("[%s:%d]\n%s\n", pAr->source+1, pAr->currentline, pLine);
+		}
+		
+		SetPropmpt();
+	}
+	
+	for (;; SetPropmpt)
+	{
+		char buffer[256];
+		while (1)
+		{
+			usleep(50000);
+			if ( fgets(buffer, 256, stdin) != 0 )
+			{
+				break;
+			}
+		}
+		
+		if ( !HandleLdbCommand(buffer, pAr) )
+		{
+			break;
+		}
+	}
+}
+
+void CLuaDebugger::all_Hook( lua_state* L, lua_Debug* pAr)
+{
+	if ( pAr->event == LUA_HOOKLINE )
+	{
+		line_hook(L, pAr);
+	}
+	else if ( pAr->event == LUA_HOOKCALL || pAr->event == LUA_HOOKRET )
+	{
+		func_hook(L, ar);
+	}
+}
+
+void CLuaDebugger::line_hook( lua_state* L, lua_Debug* pAr )
+{
+	CLuaDebugger* ldb = g_pstServiceLua->m_lua_debugger;
+	if ( NULL == ldb)
+	{
+		return;
+	}
+	
+	if ( !ldb->m_bIsEnable )
+	{
+		return;
+	}
+
+	if ( !lua_getstack(L, 0, pAr) )
+	{
+		return;
+	}
+
+	if ( lua_getinfo(L, "lnS", pAr) )
+	{
+		if ( ldb->m_bIsStep )
+		{
+			ldb->OnEvent(-1, pAr);
+		}
+		else
+		{
+			//search break point
+			int bpIndex = ldb->SeachBreaPoint(pAr);
+			if ( bpIndex < 0 )
+			{
+				return;
+			}
+			//find the break point
+			ldb->OnEvent(bpIndex, pAr);
+		}
+	}
+}
+
+void CLuaDebugger::func_hook( lua_state* L, lua_Debug* pAr )
+{
+}
+
+bool CLuaDebugger::HandleLdbCommand(const char* pCmd, lua_Debug* pAr = NULL)
+{
+	char cmd_new[4096];
+	CopyWithBackSpace( cmd_new, cmd);
+	const char ws[] = "\t\r\n";
+	const char* pCmd = cmd_new;
+	int len = 0;
+
+	if (*pCmd == 0)
+	{
+		return true;
+	}
+
+	pCmd += strspn( pCmd, ws );
+	len = strlen( pCmd, ws);
+
+	char command[32];
+	int min_len = len < 31 ? len : 31;
+	strncpy( command, pCmd, min_len);
+	command[min_len] = 0;
+	for (int i = 0; m_entries_ldb[i].cmd != NULL; i++)
+	{
+		if ( !strcmp( m_entries_ldb[i].cmd, command) )
+		{
+			CommandHandlerLdb pFunc = m_entries_ldb[i].handler;
+			const char* op = pCmd + len + strspn( pCmd + len, ws);
+			int oplen = strcspn(op, ws);
+			if ( op == pCmd + len)
+			{
+				oplen = 0;
+			}
+			return (this->*(pFunc))(pCmd, op, oplen, pAr);
+		}
+	}
+	
+	HandleCommand(pCmd, pAr);
+	return true;
+}
+
+void CLuaDebugger::HandleCommand(const char* pCmd, lua_Debug* pAr)
+{
+	int depth = GetCallDepth(m_pLuaState);
+	assert( m_iCallDepth >= -1);
+	m_iCallDepth = depth;
+
+	char cmd_new[4096];
+	CopyWithBackSpace( cmd_new, cmd);
+	const char ws[] = "\t\r\n";
+	const char* pCmd = cmd_new;
+	int len;
+
+	char command[32];
+	int min_len = len < 31 ? len : 31;
+	strncpy( command, pCmd, min_len);
+	command[min_len] = 0;
+	for (int i = 0; i < m_entries[i].cmd != NULL; i++)
+	{
+		if ( !strcmp(m_entries[i].cmd, command) )
+		{
+			CommandHandler pFunc = m_entries[i].handler;
+			const char* op = pCmd + len + strspn( pCmd+len, ws );
+			int oplen = strcspn(op, ws);
+			if ( op == pCmd+ len )
+			{
+				oplen = 0;
+			}
+			
+			(this->*(pFunc))(op, oplen, pAr);
+			return;
+		}
+	}
+}
+
+int CLuaDebugger::AddBreadPoint(const char* pFineName, uint32 lineNum, CBreakPoint::BPType type = CBreakPoint::User)
+{
+	assert( lineNum >= 0 );
+	for (int i = 0; i < LUA_MAX_BRKS; i++)
+	{
+		if ( m_arrBp[i].GetType() == CBreakPoint::None )
+		{
+			m_arrBp[i].Reset();
+			m_arrBp[i].SetName(pFineName);
+			m_arrBp[i].m_iLineNum = lineNum;
+			m_arrBp[i].m_type = type;
+			return i;
+		}
+	}
+	return -1;
+}
+
+void CLuaDebugger::HandleCmdBreakPoint(const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	if ( iOplen == 0 )
+	{
+		Print("b <fileame>:<linenum>\n");
+	}
+
+	const char* pDv = (const char*)memchr(pOp, ':', iOplen);
+	if (!pDv)
+	{
+		Print("b <filename>:<linenum>\n");
+		return;
+	}
+
+	int linenum, sc;
+	if ( sscanf(pDv+1, "%d%n", &linenum, &sc) == 0 || sc != iOplen-(pDv-pOp)-1 || linenum <= 0 )
+	{
+		Print("Invalid line number\n");
+		return;
+	}
+
+	char fn[4096];
+
+	if ( m_sSearchPath && *pOp != '/')
+	{
+		// relative path
+		strncpy(fn, m_sSearchPath, 4096);
+		fn[4095] = 0;
+		int addlen = strlen( fn );
+		int minlen = 4095 - addlen > pDv - pOp > pDv-Pop : 4095 - addlen;
+		strncat( fn + addlen, pOp, minlen);
+	}
+	else
+	{
+		//absolute path
+		int minlen = 4095 > pDv - pOp ? pDv - pOp : 4095 - addlen;
+		strncpy( fn, pOp, minlen);
+		fn[minlen] = 0;
+	}
+
+	const char* pLine = m_pSourceMgr->LoadLine( fn, linenum - 1);
+	if ( !pLine )
+	{
+		Print("cannot load source %s, line %d!\n", fn, linenum);
+		return;
+	}
+
+	int bpnum = AddBreadPoint(fn, linenum-1);
+	if ( bpnum < 0 )
+	{
+		Print("add breakpoint failed!\n");
+		return;
+	}
+	
+	Print("BreakPoint #%d is set at %.*s, line %d:\n%s\n", bpnum, pDv-Pop, pOp, linenum， line);
+	EnableLineHook(true);
+}
+
+void CLuaDebugger::HandleCmdClear( const char* pOp, int oplen, lua_Debug* ar)
+{
+	for (int i = 0; i < LUA_MAX_BRKS; i++)
+	{
+		m_arrBp[i].Reset();
+	}
+	
+	Print("All breakpoints cleared\n");
+}
+
+void CLuaDebugger::HandleCmdHelp(const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	Print("This is luya debugger instruction\n");
+	Print("\n");
+
+	Print("b <filename>:<line>  -- add breakpoint, notice: line num should not be blank line\n");
+	Print("p <varname>          -- print var name \n");
+	Print("clear                -- clear all breakpoints\n");
+
+	Print("\n");
+	Print("---------- belows are available when hit breakpoint ----------\n");
+	Print("c                    -- continue\n");
+	Print("n                    -- next\n");
+	Print("s                    -- step in\n");
+	Print("bt                   -- print call stack\n");
+}
+
+void CLuaDebugger::HandleCmdPrint(const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	if ( iOplen == 0 )
+	{
+		Print("Incorrect use of 'p'\n");
+		Print("p <var>\n");
+		return;
+	}
+	
+	PrintExpression(m_pLuaState, pOp, pAr);
+}
+
+void CLuaDebugger::SingleStep( bool isStep )
+{
+	if (isStep)
+	{
+		EnableLineHook(true);
+	}
+	m_bIsStep = isStep;
+}
+
+void CLuaDebugger::StepIn()
+{
+	if (m_bIsStep)
+	{
+		SingleStep(true);
+	}
+	m_iCallDepth = -1;
+}
+
+bool CLuaDebugger::HandlecmdContinue(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	Print("Continue...\n");
+	SingleStep(false);
+	m_iCallDepth = -1;
+	return false;
+}
+
+bool CLuaDebugger::HandleCmdNext(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	if (!m_bIsStep)
+	{
+		SingleStep(true);
+	}
+	
+	return false;
+}
+
+bool CLuaDebugger::HandleCmdStep(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	StepIn();	
+	return false;
+}
+
+bool CLuaDebugger::HandleCmdBackTrace(const char* pCmd, const char* pOp, uint32 iOplen, lua_Debug* pAr)
+{
+	lua_Debug ldb;
+	for (int i = 0; lua_getstack(m_pLuaState, i, &ldb); i++)
+	{
+		lua_getinfo( m_pLuaState, "Slnu", &ldb);
+		const char* pName = ldb.name;
+		if ( !pName )
+		{
+			pName = "";
+		}
+		const char* pFileName = ldb.source;
+		print("#%d: %s:'%s', '%s' line %d\n", i+1, ldb.what, pName, pFileName, ldb.currentline);
+	}
+	return true;
 }
